@@ -1,0 +1,4 @@
+{
+    "server_address": "localhost:50051",
+    "max_retries": 3
+}
