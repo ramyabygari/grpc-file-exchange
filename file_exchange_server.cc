@@ -1,280 +1,244 @@
 #include <iostream>
-#include <sstream>
 #include <memory>
 #include <string>
-#include <map>
+#include <vector>
+#include <string>
+#include <cstdlib>
 #include <cstdint>
-#include <stdexcept>
+#include <utility>
+#include <cassert>
+#include <sysexits.h>
+#include <chrono>
+#include <random>
+#include <limits>
 
 #include <grpc/grpc.h>
-#include <grpc++/server.h>
-#include <grpc++/server_builder.h>
-#include <grpc++/server_context.h>
-#include <grpc++/security/server_credentials.h>
+#include <grpc++/channel.h>
+#include <grpc++/client_context.h>
+#include <grpc++/create_channel.h>
+#include <grpc++/security/credentials.h>
+#include <grpc++/grpc++.h>
+#include <grpcpp/grpcpp.h>
+#include <thread>
+#include <chrono>
+
+#include <csignal>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
+#include <boost/algorithm/string.hpp>
 #include "file_exchange.grpc.pb.h"
 
-#include <mutex>
-#include <fcntl.h>
-#include <unistd.h>
-#include <cstdio>
-#include <thread>
-
-using grpc::Server;
-using grpc::ServerBuilder;
-using grpc::ServerContext;
+using grpc::Channel;
+using grpc::ClientContext;
 using grpc::Status;
-using grpc::StatusCode;
 
 using fileexchange::OffsetData;
 using fileexchange::success_failure;
 
-class FileExchangeImpl final : public fileexchange::FileExchange::Service
+class FileExchangeClient
 {
-private:
-    typedef google::protobuf::int32 FileIdKey;
-    std::mutex mutex;
-    int fileDescriptor;
-    int journalFileDescriptor;
-    bool journalOnAll;
-    bool enableJournal;
-    int groupCommit;
-    const off_t fileSize = 5ULL * 1024 * 1024 * 1024; // 10GB
-    const size_t blockSize = 4 * 1024;                 // 4KB
-
 public:
-    FileExchangeImpl(bool journalOnAll, bool enableJournal, int groupCommit):offsetMutexes(2000000) 
+    FileExchangeClient(std::shared_ptr<Channel> channel)
+        : m_stub(fileexchange::FileExchange::NewStub(channel))
     {
-        fileDescriptor = open("BlockStore", O_RDWR | O_CREAT, 0666);
-        if (fileDescriptor == -1)
+    }
+
+    bool Put(const std::vector<unsigned long long> &offsets, const std::vector<std::string> &values)
+    {
+        OffsetData request;
+
+        for (int offset : offsets)
         {
-            perror("open");
-            exit(1);
+            request.add_offsets(offset);
         }
 
-        if (lseek(fileDescriptor, fileSize - 1, SEEK_SET) == -1)
+        for (std::string value : values)
         {
-            perror("lseek");
-            exit(1);
+            request.add_values(value);
         }
 
-        if (write(fileDescriptor, "", 1) != 1)
-        {
-            perror("write");
-            exit(1);
-        }
+        success_failure response;
+        grpc::ClientContext context;
 
-        this->journalOnAll = journalOnAll;
-        this->enableJournal = enableJournal;
-        this->groupCommit = groupCommit;
-        if (enableJournal)
+        grpc::Status status;
+        int max_retry_attempts = 3;
+        int retry_count = 0;
+
+        while (retry_count < max_retry_attempts)
         {
-            journalFileDescriptor = open("journal_log", O_RDWR | O_CREAT | O_SYNC, S_IRUSR | S_IWUSR);
-            if (journalFileDescriptor == -1)
+            status = m_stub->Put(&context, request, &response);
+            int backoff_duration_ms = 10;
+            if (status.ok())
             {
-                std::cerr << "Failed to open 'journal_log'" << std::endl;
-
-                close(journalFileDescriptor);
-                exit(1);
+                break;
             }
+            else
+            {
+                retry_count++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoff_duration_ms));
+            }
+        }
 
-            std::thread journalFlushThread([this]()
-                                           {
-                try {
-                    FlushJournalPeriodically();
-                } catch (const std::exception& ex) {
-            
-                    std::cerr << "Exception in thread: " << ex.what() << std::endl;
-                } });
-            journalFlushThread.detach();
+        if (status.ok())
+        {
+            // std::cout << "Data inserted successfully at offset " << response.id() << std::endl;
+            // std::cout << response.id() << std::endl;
+            return true;
+        }
+        else
+        {
+            std::cerr << "RPC failed: " << status.error_message() << std::endl;
+            return false;
         }
     }
 
-Status Put(
-    ServerContext* context,
-    const OffsetData* request,
-    success_failure* response) override {
-
-    const google::protobuf::RepeatedField<uint64_t>& offsets = request->offsets();
-    const google::protobuf::RepeatedPtrField<std::string>& values = request->values();
-
-
-    // Lock all offsets first
-    std::vector<std::unique_lock<std::mutex>> locks;
-    for (size_t i = 0; i < offsets.size(); ++i) {
-        int offset = offsets.Get(i);
-    
-
-        if (offset >= 0) {
-            locks.emplace_back(offsetMutexes[offset]);
-        }
+    unsigned long long generateRandomNumber(unsigned long long max)
+    {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<unsigned long long> distribution(0, max);
+        return distribution(gen);
     }
-
-    for (size_t i = 0; i < offsets.size(); ++i) {
-        int offset = offsets.Get(i);
-        std::string value = values.Get(i);
-
-        if (offset >= 0) {
-            std::string journalString = std::to_string(offset) + " " + value;
-            // std::cout << journalString << std::endl;
-
-            // Write to journal
-            ssize_t JournalbytesWritten = write(journalFileDescriptor, journalString.c_str(), journalString.size());
-
-            // Flush journal for every write, else thread will block
-            if (journalOnAll) {
-                if (journalFileDescriptor != -1) {
-                    fsync(journalFileDescriptor);
-                }
-            }
-
-            // Make changes
-            off_t position = lseek(fileDescriptor, offset * blockSize, SEEK_SET);
-            if (position == -1) {
-                return grpc::Status(grpc::INTERNAL, "Failed to set file position");
-            }
-            ssize_t bytesWritten = write(fileDescriptor, value.c_str(), value.size());
-            if (bytesWritten == -1) {
-                return grpc::Status(grpc::INTERNAL, "Failed to write data to the file");
-            }
-            fsync(fileDescriptor);
-        } else {
-            return grpc::Status(grpc::INVALID_ARGUMENT, "Invalid offset");
-        }
-    }
-
-    response->set_id(1);
-    return grpc::Status::OK;
-}
-
-
-
-
-    // Status Put(
-    //     grpc::ServerContext *context,
-    //     const OffsetData *request,
-    //     success_failure *response) override
-    // {
-       
-    //     const std::string &data = request->data();
-
-    //      // const int offset = request->data();
-    //     //   std::cout<<"putss req";
-    //     if (offset < 0)
-    //     {
-    //         return grpc::Status(grpc::INVALID_ARGUMENT, "Invalid offset");
-    //     }
-
-    //     std::lock_guard<std::mutex> lock(mutex);
-    //     std::string journalString = std::to_string(offset) + " " + data;
-
-    //     // write to journal
-    //     ssize_t JournalbytesWritten = write(journalFileDescriptor, journalString.c_str(), journalString.size());
-    //     // flush  journal for every write, else thread will tc
-    //     if (journalOnAll)
-    //     {
-    //         if (journalFileDescriptor != -1)
-    //         {
-    //             fsync(journalFileDescriptor);
-    //         }
-    //     }
-
-    //     // make changes
-    //     off_t position = lseek(fileDescriptor, offset * 1024, SEEK_SET);
-    //     if (position == -1)
-    //     {
-    //         return grpc::Status(grpc::INTERNAL, "Failed to set file position");
-    //     }
-    //     ssize_t bytesWritten = write(fileDescriptor, data.c_str(), data.size());
-    //     if (bytesWritten == -1)
-    //     {
-    //         return grpc::Status(grpc::INTERNAL, "Failed to write data to the file");
-    //     }
-    //     // FILE* dataFile = fdopen(fileDescriptor, "w");
-    //     //     if (dataFile != nullptr) {
-    //     //         fflush(dataFile);
-    //     //     }
-    //     fsync(fileDescriptor);
-    //     response->set_id(offset);
-
-    //     return grpc::Status::OK;
-    // }
 
 private:
-    std::vector<std::mutex> offsetMutexes;
-
-
-    // void writeLSNToFile(unsigned long long lsn) {
-    //     std::ofstream lsnFile("lsn.txt");
-    //     if (lsnFile.is_open()) {
-    //         lsnFile << lsn;
-    //   fflush(lsnFile);
-    //         lsnFile.close();
-    //     } else {
-    //         std::cerr << "Failed to open the LSN file for writing." << std::endl;
-    //     }
-    // }
-
-    void FlushJournalPeriodically()
-    {
-        while (true)
-        {
-            // Sleep for a specified interval
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-
-            // Flush the journal
-            if (journalFileDescriptor != -1)
-            {
-                FILE *journalFile = fdopen(journalFileDescriptor, "w");
-                if (journalFile != nullptr)
-                {
-                    fflush(journalFile);
-                }
-            }
-            //  long tailOffset = ftell(journalFile);
-            // writeLSNToFile(tailOffset)
-        }
-    }
+    std::unique_ptr<fileexchange::FileExchange::Stub> m_stub;
 };
 
-void RunServer()
+void usage [[noreturn]] (const char *prog_name)
 {
-    // TODO: Allow the port to be customised
-    std::string server_address("0.0.0.0:50051");
-
-    boost::property_tree::ptree config;
-    try
-    {
-        boost::property_tree::read_json("server_config.json", config);
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "Error reading config file: " << e.what() << std::endl;
-        return exit(1);
-    }
-
-    std::string serverAddress = config.get<std::string>("server_address");
-    bool journalOnAll = config.get<bool>("journalOnAll");
-    bool enableJournal = config.get<bool>("enableJournal");
-    int32_t groupCommit = config.get<int>("groupCommit");
-    //   bool journalOnAll = true;
-    // bool enableJournal = true;
-    // int32_t groupCommit = false;
-    // FileExchangeImpl service;
-    FileExchangeImpl service(journalOnAll, enableJournal, groupCommit);
-    ;
-
-    ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service);
-    std::unique_ptr<Server> server(builder.BuildAndStart());
-    std::cout << "Server listening on " << server_address << ". Press Ctrl-C to end." << std::endl;
-    server->Wait();
+    std::cerr << "USAGE: " << prog_name << " [put|get] num_id [filename]" << std::endl;
+    std::exit(EX_USAGE);
 }
 
 int main(int argc, char **argv)
 {
-    RunServer();
-    return 0;
+    boost::property_tree::ptree config;
+    try
+    {
+        boost::property_tree::read_json("client_config.json", config);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Error reading config file: " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    std::string serverAddress = config.get<std::string>("server_address");
+    long long total_execution_time = 0;
+    long long max_put_time = 0;
+    long long count = 0;
+    FileExchangeClient client(grpc::CreateChannel(serverAddress, grpc::InsecureChannelCredentials()));
+
+    std::ifstream inputFile("/users/Ramya/workloads/client_1.txt");
+
+
+    if (!inputFile.is_open()) {
+        std::cerr << "Failed to open the input file." << std::endl;
+        return 1;
+    }
+
+    std::string inputLine;
+
+    while (std::getline(inputFile, inputLine)) {
+        // std::cout << inputLine << std::endl;
+
+        // Split the input line by semicolons to separate commands
+        std::istringstream iss(inputLine);
+        std::string command;
+
+        while (std::getline(iss, command, ';')) {
+            // Trim leading and trailing whitespace
+            command = boost::algorithm::trim_copy(command);
+
+            // Extract operation, offset, and value
+            std::string operation;
+            std:: string offset, value;
+
+            if (std::istringstream(command) >> offset >> value) {
+                // if (operation == "W") {
+                    count++;
+                    std::vector<unsigned long long> offsets = {std::stoull(offset)};
+                    std::vector<std::string> values  = {value};
+                    auto start_time = std::chrono::high_resolution_clock::now();
+
+                    client.Put(offsets, values);
+                    //  std::cout << "Done" << count << std::endl;
+                    auto end_time = std::chrono::high_resolution_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+
+                    total_execution_time += duration.count();
+                    // std::cout << "Execution time for Put: " << duration.count() << " microseconds" << std::endl;
+
+                    if (duration.count() > max_put_time) {
+                        max_put_time = duration.count();
+                    }
+                // } 
+                // else {
+                //     std::cerr << "Invalid operation: " << operation << std::endl;
+                // }
+            } else {
+                std::cerr << "Invalid command format: " << command << std::endl;
+            }
+        }
+    }
+
+    inputFile.close();
+
+    // After processing all commands from the file, print the total execution time and max_put_time.
+    std::cout << "Total execution time for all operations: " << total_execution_time << " microseconds" << std::endl;
+    std::cout << "Maximum execution time for Put: " << max_put_time << " microseconds" << std::endl;
+    std::cout << "Total Operations: " << count << std::endl;
+
+    // while (true)
+    // {
+    //     std::string inputLine;
+    //     std::getline(std::cin, inputLine);
+    //     std::cout << inputLine << std::endl;
+    //     // bool succeeded;
+    //     // Split the input line by semicolons to separate commands
+    //     std::istringstream iss(inputLine);
+    //     std::string command;
+
+    //     while (std::getline(iss, command, ';'))
+    //     {
+    //         // Trim leading and trailing whitespace
+    //         command = boost::algorithm::trim_copy(command);
+
+    //         // Extract operation, offset, and value
+    //         std::string operation;
+    //         int offset, value;
+
+    //         if (std::istringstream(command) >> operation >> offset >> value)
+    //         {
+    //             if (operation == "W")
+    //             {
+    //                 // Prepare and send the offset and value to the server
+    //                 std::vector<int> offsets = {offset};
+    //                 std::vector<int> values = {value};
+    //                 auto start_time = std::chrono::high_resolution_clock::now();
+    //                 client.Put(offsets, values);
+    //                 auto end_time = std::chrono::high_resolution_clock::now();
+    //                 auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+
+    //                 total_execution_time += duration.count();
+    //                 std::cout << "Execution time for Put: " << duration.count() << " microseconds" << std::endl;
+
+    //                 if (duration.count() > max_put_time)
+    //                 {
+    //                     max_put_time = duration.count();
+    //                 }
+    //             }
+    //             else
+    //             {
+    //                 std::cerr << "Invalid operation: " << operation << std::endl;
+    //             }
+    //         }
+    //         else
+    //         {
+    //             std::cerr << "Invalid command format: " << command << std::endl;
+    //         }
+    //     }
+    // }
+
+    return EXIT_SUCCESS;
 }
