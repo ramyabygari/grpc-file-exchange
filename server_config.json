@@ -1,7 +1,7 @@
 {
-    "server_address": "localhost:50051",
+    "server_address": "0.0.0.0:50051",
     "max_retries": 3,
-    "journalOnAll": false,
-    "enableJournal": false,
+    "journalOnAll": true,
+    "enableJournal": true,
     "groupCommit": 100
 }
