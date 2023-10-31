@@ -1,6 +1,6 @@
 HOST_SYSTEM = $(shell uname | cut -f 1 -d_)
 SYSTEM ?= $(HOST_SYSTEM)
-CXX = g++
+CXX = g++ -pg
 CPPFLAGS += `pkg-config --cflags protobuf grpc`
 CXXFLAGS += -std=c++14
 ifeq ($(SYSTEM),Darwin)
@@ -21,7 +21,7 @@ PROJECT_NAME = file_exchange
 
 # FIXME: Define dependencies on the h files correctly using e.g. makedepend
 
-COMMON_OBJS = $(PROJECT_NAME).pb.o $(PROJECT_NAME).grpc.pb.o sequential_file_reader.o sequential_file_writer.o utils.o messages.o
+COMMON_OBJS = $(PROJECT_NAME).pb.o $(PROJECT_NAME).grpc.pb.o 
 
 vpath %.proto $(PROTOS_PATH)
 
